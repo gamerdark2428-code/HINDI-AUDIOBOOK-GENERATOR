@@ -17,6 +17,9 @@ import io
 import os
 import re
 import time
+import glob
+import shutil
+import atexit
 import zipfile
 import tempfile
 import traceback
@@ -35,6 +38,62 @@ try:
     LANGDETECT_AVAILABLE = True
 except Exception:
     LANGDETECT_AVAILABLE = False
+
+
+# =============================================================================
+# FFMPEG DETECTION (pydub needs ffmpeg/ffprobe on PATH to decode/encode MP3)
+# =============================================================================
+
+def _locate_ffmpeg() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Explicitly resolve ffmpeg/ffprobe from the system PATH and wire them into
+    pydub. This avoids silent failures where pydub can't find the binary
+    (common on minimal containers) and lets us fail fast with a clear message
+    instead of a confusing subprocess traceback mid-pipeline.
+    """
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    if ffmpeg_path:
+        AudioSegment.converter = ffmpeg_path
+        AudioSegment.ffmpeg = ffmpeg_path
+    if ffprobe_path:
+        AudioSegment.ffprobe = ffprobe_path
+    elif ffmpeg_path:
+        # Some minimal installs only ship the ffmpeg binary; ffprobe calls
+        # fall back to ffmpeg itself, which pydub tolerates in most cases.
+        AudioSegment.ffprobe = ffmpeg_path
+    return ffmpeg_path, ffprobe_path
+
+
+FFMPEG_PATH, FFPROBE_PATH = _locate_ffmpeg()
+FFMPEG_AVAILABLE = FFMPEG_PATH is not None
+
+
+# =============================================================================
+# STALE TEMP-DIR CLEANUP (guards against disk exhaustion across sessions)
+# =============================================================================
+
+def cleanup_stale_temp_dirs(max_age_seconds: int = 3600):
+    """
+    Remove any leftover 'hindi_audiobook_*' temp directories from crashed or
+    interrupted previous runs (e.g., a user closing the tab mid-conversion).
+    Streamlit Cloud containers are ephemeral but long-lived across many user
+    sessions, so orphaned temp files can otherwise accumulate and exhaust
+    the container's disk quota over time.
+    """
+    base = tempfile.gettempdir()
+    pattern = os.path.join(base, "hindi_audiobook_*")
+    now = time.time()
+    for path in glob.glob(pattern):
+        try:
+            if os.path.isdir(path) and (now - os.path.getmtime(path)) > max_age_seconds:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+cleanup_stale_temp_dirs()
+atexit.register(cleanup_stale_temp_dirs, max_age_seconds=0)
 
 
 # =============================================================================
@@ -333,15 +392,33 @@ def synthesize_chunk_with_retry(
     Convert a single Hindi text chunk into an AudioSegment via gTTS,
     with retries and graceful failure (returns None on total failure so
     the pipeline can skip it instead of crashing).
+
+    Disk-safety: every attempt uses a fresh NamedTemporaryFile that is
+    guaranteed to be removed in a `finally` block regardless of whether the
+    attempt succeeded, failed, or raised -- previously the temp file was
+    only cleaned up on the final failed attempt, which silently leaked one
+    MP3 file per *successful* chunk (a real problem across a 300+ page book).
     """
     hindi_text = sanitize_devanagari(hindi_text)
     if not hindi_text:
         return None
 
-    tmp_path = os.path.join(tmp_dir, f"chunk_{idx:05d}.mp3")
+    if not FFMPEG_AVAILABLE:
+        raise RuntimeError(
+            "ffmpeg was not found on the system PATH. pydub requires ffmpeg to "
+            "decode/encode MP3 audio. Make sure 'ffmpeg' is listed in packages.txt "
+            "and that the app has redeployed since it was added."
+        )
+
     last_err = None
     for attempt in range(max_retries):
+        tmp_path = None
         try:
+            with tempfile.NamedTemporaryFile(
+                dir=tmp_dir, prefix=f"chunk_{idx:05d}_", suffix=".mp3", delete=False
+            ) as tmp_f:
+                tmp_path = tmp_f.name
+
             tts = gTTS(text=hindi_text, lang="hi", slow=False)
             tts.save(tmp_path)
             segment = AudioSegment.from_mp3(tmp_path)
@@ -351,8 +428,9 @@ def synthesize_chunk_with_retry(
             wait = (2 ** attempt) + 0.5
             time.sleep(wait)
         finally:
-            # remove the temp mp3 immediately after loading into memory
-            if os.path.exists(tmp_path) and attempt == max_retries - 1:
+            # Always remove the temp mp3 immediately after use, on every
+            # attempt, so no chunk file ever survives beyond its own call.
+            if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
                 except OSError:
@@ -388,6 +466,14 @@ def run_pipeline(
     Full end-to-end pipeline: extract -> clean -> (translate) -> TTS -> stitch.
     Progress callbacks update the Streamlit UI in real time.
     """
+    if not FFMPEG_AVAILABLE:
+        raise RuntimeError(
+            "ffmpeg is not available on this deployment's system PATH. "
+            "Add a file named 'packages.txt' containing a single line 'ffmpeg' "
+            "to the repo root and redeploy (Streamlit Cloud/HF Spaces install it "
+            "automatically as a system dependency)."
+        )
+
     # ---- STAGE 1: EXTRACTION ----
     status_text.markdown("📄 **Stage 1/4:** Extracting text from PDF...")
     log("Starting PDF extraction")
@@ -465,89 +551,4 @@ def run_pipeline(
             progress_bar.progress(min(pct_stage, 0.90))
 
         if not audio_segments:
-            raise RuntimeError(
-                "Audio synthesis failed for all chunks. This is usually caused by a "
-                "temporary network issue with the translation/TTS service — please try again."
-            )
-
-        # ---- STAGE 4: STITCHING ----
-        status_text.markdown("🧵 **Stage 4/4:** Stitching audio chunks into final audiobook...")
-        log("Stitching audio segments")
-
-        silence = AudioSegment.silent(duration=180)
-        final_audio = AudioSegment.empty()
-        segment_files_for_zip = []
-
-        for idx, seg in enumerate(audio_segments):
-            final_audio += seg + silence
-            if make_zip_segments:
-                segment_files_for_zip.append((idx, seg))
-
-        if abs(playback_speed - 1.0) > 0.01:
-            try:
-                final_audio = speedup(final_audio, playback_speed=playback_speed)
-                log(f"Applied playback speed adjustment: {playback_speed}x")
-            except Exception as e:
-                log(f"⚠️ Speed adjustment failed, using normal speed: {e}")
-
-        progress_bar.progress(0.96)
-
-        # Export final master MP3 to memory
-        final_buf = io.BytesIO()
-        final_audio.export(final_buf, format="mp3", bitrate="128k")
-        final_bytes = final_buf.getvalue()
-        final_buf.close()
-
-        # Optionally build a ZIP of ~10-chunk segments (acts as "chapters")
-        segment_zip_bytes = None
-        if make_zip_segments:
-            zip_buf = io.BytesIO()
-            group_size = max(1, len(segment_files_for_zip) // 10) if len(segment_files_for_zip) > 10 else len(segment_files_for_zip)
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                group_audio = AudioSegment.empty()
-                group_idx = 1
-                count_in_group = 0
-                for idx, seg in segment_files_for_zip:
-                    group_audio += seg + silence
-                    count_in_group += 1
-                    if count_in_group >= max(group_size, 1):
-                        part_buf = io.BytesIO()
-                        group_audio.export(part_buf, format="mp3", bitrate="128k")
-                        zf.writestr(f"Part_{group_idx:02d}_Hindi.mp3", part_buf.getvalue())
-                        part_buf.close()
-                        group_audio = AudioSegment.empty()
-                        group_idx += 1
-                        count_in_group = 0
-                if len(group_audio) > 0:
-                    part_buf = io.BytesIO()
-                    group_audio.export(part_buf, format="mp3", bitrate="128k")
-                    zf.writestr(f"Part_{group_idx:02d}_Hindi.mp3", part_buf.getvalue())
-                    part_buf.close()
-            segment_zip_bytes = zip_buf.getvalue()
-            zip_buf.close()
-
-        progress_bar.progress(1.0)
-        status_text.markdown("✅ **Done!** Your Hindi audiobook is ready below.")
-        log(f"Pipeline complete. {failed_chunks} chunk(s) failed and were skipped.")
-
-        preview_text = " ".join(hindi_chunks[:6])[:1200]
-
-        return PipelineResult(
-            final_audio=final_bytes,
-            segment_zip=segment_zip_bytes,
-            hindi_preview=preview_text,
-            total_chunks=total_chunks,
-            failed_chunks=failed_chunks,
-        )
-    finally:
-        # ---- MEMORY / DISK CLEANUP ----
-        try:
-            for f in os.listdir(tmp_dir):
-                try:
-                    os.remove(os.path.join(tmp_dir, f))
-                except OSError:
-                    pass
-            os.rmdir(tmp_dir)
-        except OSError:
-            pass
-        # Dro
+            raise RuntimeErro
