@@ -4,3 +4,4 @@ deep-translator==1.11.4
 gTTS==2.5.3
 pydub==0.25.1
 langdetect==1.0.9
+pillow==10.0.0
